@@ -2,6 +2,7 @@ package com.weare5stones.keycloak.authenticators.emailotp;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import java.util.HashMap;
 import java.util.List;
@@ -20,12 +21,14 @@ import org.keycloak.sessions.AuthenticationSessionModel;
 
 public class EmailOTPAuthenticator implements Authenticator {
 
+  private static final Logger logger = Logger.getLogger(EmailOTPAuthenticator.class);
+
   private static final String TOTP_FORM = "totp-form.ftl";
+  private static final String USERNAME_FORM = "login-username.ftl";
   private static final String TOTP_EMAIL = "totp-email.ftl";
   private static final String AUTH_NOTE_CODE = "code";
   private static final String AUTH_NOTE_TTL = "ttl";
   private static final String AUTH_NOTE_REMAINING_RETRIES = "remainingRetries";
-  private static final Logger logger = Logger.getLogger(EmailOTPAuthenticator.class);
 
   private static final String ALPHA_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   private static final String ALPHA_LOWER = "abcdefghijklmnopqrstuvwxyz";
@@ -33,21 +36,37 @@ public class EmailOTPAuthenticator implements Authenticator {
 
   @Override
   public void authenticate(AuthenticationFlowContext context) {
-    AuthenticatorConfigModel config = context.getAuthenticatorConfig();
     KeycloakSession session = context.getSession();
+    AuthenticationSessionModel authSession = context.getAuthenticationSession();
+
+    // If user is not yet set, prompt for username
+    if (context.getUser() == null) {
+      context.challenge(context.form().createForm(USERNAME_FORM));
+      return;
+    }
+
+    AuthenticatorConfigModel config = context.getAuthenticatorConfig();
     UserModel user = context.getUser();
+
+    boolean requireVerifiedEmail = Boolean.parseBoolean(config.getConfig()
+        .getOrDefault(EmailOTPAuthenticatorFactory.CONFIG_PROP_REQUIRE_VERIFIED_EMAIL, "false"));
+
+    if (requireVerifiedEmail && !user.isEmailVerified()) {
+      context.failureChallenge(
+          AuthenticationFlowError.INVALID_USER,
+          context.form().setError("emailNotVerified").createErrorPage(Response.Status.FORBIDDEN)
+      );
+      return;
+    }
 
     int ttl = Integer.parseInt(config.getConfig().get(EmailOTPAuthenticatorFactory.CONFIG_PROP_TTL));
     String emailSubject = config.getConfig().get(EmailOTPAuthenticatorFactory.CONFIG_PROP_EMAIL_SUBJECT);
-    Boolean isSimulation = Boolean.parseBoolean(
-        config.getConfig()
-            .getOrDefault(
-                EmailOTPAuthenticatorFactory.CONFIG_PROP_SIMULATION,
-                "false"));
+    boolean isSimulation = Boolean.parseBoolean(config.getConfig()
+        .getOrDefault(EmailOTPAuthenticatorFactory.CONFIG_PROP_SIMULATION, "false"));
 
     String code = getCode(config);
     int maxRetries = getMaxRetries(config);
-    AuthenticationSessionModel authSession = context.getAuthenticationSession();
+
     authSession.setAuthNote(AUTH_NOTE_CODE, code);
     authSession.setAuthNote(AUTH_NOTE_TTL, Long.toString(System.currentTimeMillis() + (ttl * 1000L)));
     authSession.setAuthNote(AUTH_NOTE_REMAINING_RETRIES, Integer.toString(maxRetries));
@@ -56,10 +75,7 @@ public class EmailOTPAuthenticator implements Authenticator {
       RealmModel realm = context.getRealm();
 
       if (isSimulation) {
-        logger.warn(String.format(
-            "***** SIMULATION MODE ***** Would send a TOTP email to %s with code: %s",
-            user.getEmail(),
-            code));
+        logger.warnf("***** SIMULATION MODE ***** Would send a TOTP email to %s with code: %s", user.getEmail(), code);
       } else {
         String realmName = Strings.isNullOrEmpty(realm.getDisplayName()) ? realm.getName() : realm.getDisplayName();
         List<Object> subjAttr = ImmutableList.of(realmName);
@@ -71,16 +87,12 @@ public class EmailOTPAuthenticator implements Authenticator {
             .setRealm(realm)
             .setUser(user)
             .setAttribute("realmName", realmName)
-            .send(
-                emailSubject,
-                subjAttr,
-                TOTP_EMAIL,
-                attributes);
+            .send(emailSubject, subjAttr, TOTP_EMAIL, attributes);
       }
 
-      context.challenge(context.form().setAttribute("realm", context.getRealm()).createForm(TOTP_FORM));
+      context.challenge(context.form().setAttribute("realm", realm).createForm(TOTP_FORM));
     } catch (Exception e) {
-      logger.error("An error occurred when attempting to email an TOTP auth:", e);
+      logger.error("An error occurred when attempting to email a TOTP code:", e);
       context.failureChallenge(AuthenticationFlowError.INTERNAL_ERROR,
           context.form().setError("emailTOTPEmailNotSent", e.getMessage())
               .createErrorPage(Response.Status.INTERNAL_SERVER_ERROR));
@@ -89,8 +101,25 @@ public class EmailOTPAuthenticator implements Authenticator {
 
   @Override
   public void action(AuthenticationFlowContext context) {
-    String enteredCode = context.getHttpRequest().getDecodedFormParameters().getFirst("code");
+    MultivaluedMap<String, String> formParams = context.getHttpRequest().getDecodedFormParameters();
 
+    // Handle username form submission if user isn't set
+    if (context.getUser() == null && formParams.containsKey("username")) {
+      String username = formParams.getFirst("username");
+      UserModel user = context.getSession().users().getUserByUsername(context.getRealm(), username);
+
+      if (user == null || user.getEmail() == null) {
+        context.failureChallenge(AuthenticationFlowError.UNKNOWN_USER,
+            context.form().setError("emailOTPUnknownUser").createErrorPage(Response.Status.BAD_REQUEST));
+        return;
+      }
+
+      context.setUser(user);
+      authenticate(context); // Re-run authenticate phase now that user is set
+      return;
+    }
+
+    String enteredCode = formParams.getFirst("code");
     AuthenticationSessionModel authSession = context.getAuthenticationSession();
     String code = authSession.getAuthNote(AUTH_NOTE_CODE);
     String ttl = authSession.getAuthNote(AUTH_NOTE_TTL);
@@ -103,25 +132,19 @@ public class EmailOTPAuthenticator implements Authenticator {
       return;
     }
 
-    boolean isValid = enteredCode.equals(code);
-    if (isValid) {
+    if (enteredCode.equals(code)) {
       if (Long.parseLong(ttl) < System.currentTimeMillis()) {
-        // expired
         context.failureChallenge(AuthenticationFlowError.EXPIRED_CODE,
             context.form().setError("emailTOTPCodeExpired").createErrorPage(Response.Status.BAD_REQUEST));
       } else {
-        // valid
         if (!context.getUser().isEmailVerified()) {
           context.getUser().setEmailVerified(true);
         }
         context.success();
       }
     } else {
-      // Code is invalid
       if (remainingAttempts > 0) {
         authSession.setAuthNote(AUTH_NOTE_REMAINING_RETRIES, Integer.toString(remainingAttempts - 1));
-
-        // Inform user of the remaining attempts
         context.failureChallenge(
             AuthenticationFlowError.INVALID_CREDENTIALS,
             context.form()
@@ -136,7 +159,7 @@ public class EmailOTPAuthenticator implements Authenticator {
 
   @Override
   public boolean requiresUser() {
-    return true;
+    return false; // because we can prompt for username
   }
 
   @Override
@@ -145,63 +168,35 @@ public class EmailOTPAuthenticator implements Authenticator {
   }
 
   @Override
-  public void setRequiredActions(KeycloakSession session, RealmModel realm, UserModel user) {
-  }
+  public void setRequiredActions(KeycloakSession session, RealmModel realm, UserModel user) {}
 
   @Override
-  public void close() {
-  }
+  public void close() {}
 
   private int getMaxRetries(AuthenticatorConfigModel config) {
-    int maxRetries = Integer.parseInt(
-        config.getConfig()
-            .getOrDefault(
-                EmailOTPAuthenticatorFactory.CONFIG_PROP_MAX_RETRIES,
-                "3"));
-    return maxRetries;
+    return Integer.parseInt(
+        config.getConfig().getOrDefault(EmailOTPAuthenticatorFactory.CONFIG_PROP_MAX_RETRIES, "3"));
   }
 
   private String getCode(AuthenticatorConfigModel config) {
     int length = Integer.parseInt(config.getConfig().get(EmailOTPAuthenticatorFactory.CONFIG_PROP_LENGTH));
-    Boolean allowUppercase = Boolean.parseBoolean(
-        config.getConfig()
-            .getOrDefault(
-                EmailOTPAuthenticatorFactory.CONFIG_PROP_ALLOW_UPPERCASE,
-                "true"));
-    Boolean allowLowercase = Boolean.parseBoolean(
-        config.getConfig()
-            .getOrDefault(
-                EmailOTPAuthenticatorFactory.CONFIG_PROP_ALLOW_LOWERCASE,
-                "true"));
-    Boolean allowNumbers = Boolean.parseBoolean(
-        config.getConfig()
-            .getOrDefault(
-                EmailOTPAuthenticatorFactory.CONFIG_PROP_ALLOW_NUMBERS,
-                "true"));
+    boolean allowUppercase = Boolean.parseBoolean(
+        config.getConfig().getOrDefault(EmailOTPAuthenticatorFactory.CONFIG_PROP_ALLOW_UPPERCASE, "true"));
+    boolean allowLowercase = Boolean.parseBoolean(
+        config.getConfig().getOrDefault(EmailOTPAuthenticatorFactory.CONFIG_PROP_ALLOW_LOWERCASE, "true"));
+    boolean allowNumbers = Boolean.parseBoolean(
+        config.getConfig().getOrDefault(EmailOTPAuthenticatorFactory.CONFIG_PROP_ALLOW_NUMBERS, "true"));
 
     StringBuilder sb = new StringBuilder();
+    if (allowUppercase) sb.append(ALPHA_UPPER);
+    if (allowLowercase) sb.append(ALPHA_LOWER);
+    if (allowNumbers) sb.append(NUM);
 
-    if (allowUppercase) {
-      sb.append(ALPHA_UPPER);
-    }
-    if (allowLowercase) {
-      sb.append(ALPHA_LOWER);
-    }
-    if (allowNumbers) {
-      sb.append(NUM);
-    }
-
-    // if the string builder is empty allow all charsets as default
     if (sb.length() == 0) {
-      sb.append(ALPHA_UPPER)
-          .append(ALPHA_LOWER)
-          .append(NUM);
+      sb.append(ALPHA_UPPER).append(ALPHA_LOWER).append(NUM);
     }
 
     char[] symbols = sb.toString().toCharArray();
-    return SecretGenerator
-        .getInstance()
-        .randomString(length, symbols);
+    return SecretGenerator.getInstance().randomString(length, symbols);
   }
-
 }
